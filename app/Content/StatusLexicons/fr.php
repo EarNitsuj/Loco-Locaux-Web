@@ -1,0 +1,60 @@
+<?php
+
+return [
+    'cancelled' => [
+        'keywords' => ['annul(?:é|ée|és|ées|e|es)', 'annulation'],
+        'strong_phrases' => ['(?:événement|manifestation|concert|séance|atelier|activité|spectacle|rencontre|cours|visite|festival|représentation)\s+(?:est\s+|a\s+été\s+|sera\s+)?annul(?:é|ée|és|ées|e|es)'],
+        'subjects' => ['événement', 'manifestation', 'concert', 'séance', 'atelier', 'activité', 'spectacle', 'rencontre', 'cours', 'visite', 'festival', 'représentation'],
+        'exclusions' => ['parking', 'route', 'rue', 'bureau', 'guichet', 'accueil', 'service', 'bâtiment'],
+        'negations' => ["n['’]est\s+pas\s+annul(?:é|ée|és|ées|e|es)", 'non\s+annul(?:é|ée|és|ées|e|es)', 'aucune\s+annulation', 'sans\s+annulation', 'maintenu.{0,40}annul(?:é|ée|és|ées|e|es)'],
+        'contradictions' => ['(?:événement|concert|séance|spectacle).{0,30}(?:maintenu|confirmé)'],
+    ],
+    'postponed' => [
+        'keywords' => ['report(?:é|ée|és|ées|e|es)'],
+        'strong_phrases' => ['(?:événement|manifestation|concert|séance|atelier|activité|spectacle|rencontre|cours|visite|festival|représentation)\s+(?:est\s+|a\s+été\s+|sera\s+)?report(?:é|ée|és|ées|e|es)', 'report(?:é|ée)\s+à\s+une\s+date\s+ultérieure'],
+        'subjects' => ['événement', 'manifestation', 'concert', 'séance', 'atelier', 'activité', 'spectacle', 'rencontre', 'cours', 'visite', 'festival', 'représentation', 'date'],
+        'exclusions' => ['rapport', 'article', 'dossier', 'document'],
+        'negations' => ["n['’]est\s+pas\s+report(?:é|ée|és|ées|e|es)", 'non\s+report(?:é|ée|és|ées|e|es)'],
+        'contradictions' => ['(?:événement|concert|séance|spectacle).{0,30}(?:maintenu|confirmé)'],
+    ],
+    'suspended' => [
+        'keywords' => ['suspendu(?:e|es|s)?', 'en\s+suspens'],
+        'strong_phrases' => ['(?:événement|manifestation|concert|séance|atelier|activité|spectacle|rencontre|cours|visite|festival|représentation)\s+(?:est\s+|a\s+été\s+|sera\s+)?(?:suspendu(?:e|es|s)?|en\s+suspens)'],
+        'subjects' => ['événement', 'manifestation', 'concert', 'séance', 'atelier', 'activité', 'spectacle', 'rencontre', 'cours', 'visite', 'festival', 'représentation'],
+        'exclusions' => ['service', 'compte', 'ligne', 'abonnement'],
+        'negations' => ["n['’]est\s+pas\s+suspendu(?:e|es|s)?", 'non\s+suspendu(?:e|es|s)?'],
+        'contradictions' => ['(?:événement|concert|séance|spectacle).{0,30}(?:maintenu|confirmé)'],
+    ],
+    'rescheduled' => [
+        'keywords' => ['reprogramm(?:é|ée|és|ées|e|es)', 'date.{0,50}modifiée'],
+        'strong_phrases' => ['(?:événement|manifestation|concert|séance|atelier|activité|spectacle|rencontre|cours|visite|festival|représentation)\s+(?:est\s+|a\s+été\s+|sera\s+)?reprogramm(?:é|ée|és|ées|e|es)', 'date\s+de\s+(?:l[’\'](?:événement|activité|atelier)|la\s+manifestation)\s+(?:a\s+été\s+)?modifiée'],
+        'subjects' => ['événement', 'manifestation', 'concert', 'séance', 'atelier', 'activité', 'spectacle', 'rencontre', 'cours', 'visite', 'festival', 'représentation', 'date'],
+        'exclusions' => ['programme', 'calendrier éditorial', 'émission'],
+        'negations' => ["n['’]est\s+pas\s+reprogramm(?:é|ée|és|ées|e|es)", 'date\s+inchangée'],
+        'contradictions' => [],
+    ],
+    'moved-online' => [
+        'keywords' => ['(?:aura|auront|a)\s+(?:finalement\s+)?lieu\s+en\s+ligne', 'déplac(?:é|ée|és|ées)e?\s+en\s+ligne', 'passe\s+en\s+ligne'],
+        'strong_phrases' => ['(?:événement|manifestation|concert|séance|atelier|activité|spectacle|rencontre|cours|visite|festival|représentation).{0,40}(?:lieu|déplac(?:é|ée)|passe).{0,20}en\s+ligne'],
+        'subjects' => ['événement', 'manifestation', 'concert', 'séance', 'atelier', 'activité', 'spectacle', 'rencontre', 'cours', 'visite', 'festival', 'représentation'],
+        'exclusions' => ['billetterie', 'programme', 'brochure', 'informations?', 'inscription'],
+        'negations' => ['pas\s+en\s+ligne', 'uniquement\s+les\s+inscriptions?.{0,20}en\s+ligne'],
+        'contradictions' => [],
+    ],
+    'fully-booked' => [
+        'keywords' => ['compl(?:et|ète|ets|ètes)', 'toutes?\s+les\s+places\s+(?:sont\s+)?prises', "(?:il\s+)?n['’]y\s+a\s+plus\s+de\s+places\s+disponibles?", 'plus\s+aucune\s+place', 'capacité\s+atteinte'],
+        'strong_phrases' => ['(?:événement|manifestation|concert|séance|atelier|activité|spectacle|rencontre|cours|visite|festival|représentation)\s+(?:est\s+|affiche\s+)?compl(?:et|ète)', 'toutes?\s+les\s+places\s+(?:sont\s+)?prises', "(?:il\s+)?n['’]y\s+a\s+plus\s+de\s+places\s+disponibles?", 'plus\s+aucune\s+place', 'capacité\s+(?:maximale\s+)?atteinte'],
+        'subjects' => ['événement', 'manifestation', 'concert', 'séance', 'atelier', 'activité', 'spectacle', 'rencontre', 'cours', 'visite', 'festival', 'représentation', 'inscriptions?', 'réservations?', 'billets?', 'places?', 'capacité', 'participants?'],
+        'exclusions' => ['programme', 'agenda', 'calendrier', 'documentation', 'description', 'détails?', 'informations?', 'liste', 'version', 'brochure', 'article', 'fichier', 'dossier'],
+        'negations' => ["n['’]est\s+pas\s+compl(?:et|ète)", 'non\s+complet'],
+        'contradictions' => ['places?\s+(?:sont\s+)?encore\s+disponibles?', 'des\s+places\s+sont\s+disponibles?', 'inscriptions?\s+(?:restent|sont)\s+ouvertes?'],
+    ],
+    'sold-out' => [
+        'keywords' => ['(?:billets?|tickets?)\s+(?:sont\s+)?épuis(?:é|ée|és|ées)', 'à\s+guichets?\s+fermés?'],
+        'strong_phrases' => ['(?:billets?|tickets?)\s+(?:sont\s+)?épuis(?:é|ée|és|ées)', '(?:événement|concert|spectacle|représentation)\s+à\s+guichets?\s+fermés?'],
+        'subjects' => ['événement', 'concert', 'spectacle', 'représentation', 'billets?', 'tickets?', 'billetterie'],
+        'exclusions' => ['stock', 'brochure', 'édition', 'livre'],
+        'negations' => ['billets?\s+pas\s+épuisés?', 'billets?\s+encore\s+disponibles?'],
+        'contradictions' => ['billets?\s+encore\s+disponibles?', 'billetterie\s+ouverte'],
+    ],
+];
