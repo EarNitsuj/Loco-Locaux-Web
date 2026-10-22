@@ -14,48 +14,65 @@ class StartCrawl
         private readonly CrawlerAdapterRegistry $registry
     ) {}
 
-    public function start(
-        CrawlOptions $options
-    ): CrawlRun {
-        $sources = $this->sources(
-            $options
-        );
+    public function start(CrawlOptions $options): CrawlRun
+    {
+        return $this->createRun($options, $this->sources($options));
+    }
 
-        $run = CrawlRun::create([
-            'status' =>
-            CrawlRunStatus::Running,
+    /**
+     * Start a test run for exactly ONE source, rather than every source
+     * belonging to the selected commune.
+     */
+    public function startForSource(CrawlOptions $options, EventSource $source): CrawlRun
+    {
+        if (
+            ! $source->is_active || ! is_string($source->adapter)
+            || ! $this->registry->hasAdapter($source->adapter)
+        ) {
+            throw new \InvalidArgumentException('Selected source is inactive or unsupported.');
+        }
 
-            'options' =>
-            $options->toArray(),
+        if (
+            $options->communeSlugs === null
+            || $source->commune === null
+            || ! in_array($source->commune->slug, $options->communeSlugs, true)
+        ) {
+            throw new \InvalidArgumentException('Source does not belong to the selected commune.');
+        }
 
-            'sources_total' =>
-            $sources->count(),
+        return $this->createRun($options, new Collection([$source]));
+    }
 
-            'started_at' =>
-            now(),
-        ]);
-
-        foreach ($sources as $source) {
-            $run->sources()->create([
-                'event_source_id' =>
-                $source->id,
-
-                'status' =>
-                CrawlRunStatus::Pending,
+    /** @param Collection<int, EventSource> $sources */
+    private function createRun(CrawlOptions $options, Collection $sources): CrawlRun
+    {
+        return \Illuminate\Support\Facades\DB::transaction(function () use ($options, $sources): CrawlRun {
+            $run = CrawlRun::create([
+                'status' => CrawlRunStatus::Running,
+                'options' => $options->toArray(),
+                'sources_total' => $sources->count(),
+                'started_at' => now(),
             ]);
-        }
 
-        if ($sources->isEmpty()) {
-            $run->forceFill([
-                'status' =>
-                CrawlRunStatus::Completed,
+            foreach ($sources as $source) {
+                $run->sources()->create([
+                    'event_source_id' => $source->id,
+                    'status' => CrawlRunStatus::Pending,
+                    'snapshot_requested' => false,
+                    'snapshot_complete' => false,
+                    'snapshot_incomplete_reason' => 'limited_or_non_snapshot_run',
+                ]);
+            }
 
-                'finished_at' =>
-                now(),
-            ])->save();
-        }
+            if ($sources->isEmpty()) {
+                $run->forceFill([
+                    'status' => CrawlRunStatus::Completed,
+                    'finished_at' => now(),
+                ])->save();
+            }
 
-        return $run;
+            return $run;
+        });
     }
 
     /**

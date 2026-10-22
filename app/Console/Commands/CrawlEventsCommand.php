@@ -212,8 +212,6 @@ class CrawlEventsCommand extends Command
                 : 'limited_or_non_snapshot_run',
         ]);
 
-        $run = $starter->start($options);
-
         $run->load(
             'sources.eventSource.commune'
         );

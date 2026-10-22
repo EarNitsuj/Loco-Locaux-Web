@@ -1,21 +1,113 @@
 <?php
 
-use Livewire\Component;
+use App\Crawling\Data\CrawlOptions;
+use App\Crawling\Services\CrawlerAdapterRegistry;
+use App\Crawling\Services\StartCrawl;
+use App\Enums\CrawlRunStatus;
+use App\Jobs\CrawlCommune;
+use App\Models\Category;
+use App\Models\Commune;
+use App\Models\CrawlRun;
+use App\Models\CrawlRunSource;
 use App\Models\Event;
+use App\Models\EventSource;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\RateLimiter;
+use Carbon\CarbonImmutable;
+use Livewire\Component;
 
 new class extends Component {
     public array $locales = ['fr', 'en', 'de', 'it', 'pt', 'es'];
     public $events;
 
+    public array $testCommunes = [];
+    public string $selectedCommune = '';
+    public ?int $testRunId = null;
+    public bool $testProcessing = false;
+    public string $testMessage = '';
+    public array $testResult = [];
+
     public function mount(): void
     {
         $locale = request()->route('locale') ?? session('locale');
 
-        $this->events = Event::all();
-
         if (is_string($locale) && in_array($locale, $this->locales, true)) {
             app()->setLocale($locale);
         }
+
+        $this->refreshEventList();
+        $this->refreshCommuneOptions();
+        $this->restoreProcessingStatus();
+    }
+
+    /**
+     * Restore the previous run from the session, or recover an existing limited
+     * crawl from persistent database records (including runs started before this fix).
+     * This means reloading the page does not erase the processing indicator.
+     */
+    private function restoreProcessingStatus(): void
+    {
+        $savedRunId = session('loco_test_run_id');
+
+        if (is_numeric($savedRunId)) {
+            $saved = CrawlRun::find((int) $savedRunId);
+            if ($saved !== null) {
+                $this->testRunId = $saved->id;
+            } else {
+                session()->forget('loco_test_run_id');
+            }
+        }
+
+        if ($this->testRunId === null) {
+            // Recover an active crawl, but NEVER resurrect an already completed
+            // success message on the next browser refresh. A run saved in the
+            // session is still restored while its translations are pending.
+            $candidate = CrawlRun::query()
+                ->with('sources.eventSource.commune')
+                ->whereNull('finished_at')
+                ->where('started_at', '>=', now()->subDay())
+                ->orderByDesc('id')
+                ->limit(60)
+                ->get()
+                ->first(function (CrawlRun $run): bool {
+                    $options = $run->options ?? [];
+
+                    if (($options['scheduled'] ?? false) || ($options['all'] ?? false) || ($options['without_enrichment'] ?? false) || (int) ($options['event_limit'] ?? 0) !== 1 || $run->sources->count() !== 1 || $run->sources->first()?->eventSource?->commune_id === null) {
+                        return false;
+                    }
+
+                    return ($options['test_interface'] ?? false) || $run->finished_at === null;
+                });
+
+            if ($candidate !== null) {
+                $this->testRunId = $candidate->id;
+            }
+        }
+
+        if ($this->testRunId === null) {
+            return;
+        }
+
+        $run = CrawlRun::query()->with('sources.eventSource.commune')->find($this->testRunId);
+
+        $slug = $run?->sources->first()?->eventSource?->commune?->slug;
+        if (is_string($slug)) {
+            $this->selectedCommune = $slug;
+        }
+
+        session()->put('loco_test_run_id', $this->testRunId);
+        $this->refreshProcessingStatus();
+    }
+
+    /** Hide completed results and prevent restoring them after a refresh. */
+    private function clearCompletedTest(): void
+    {
+        $this->testRunId = null;
+        $this->testProcessing = false;
+        $this->testMessage = '';
+        $this->testResult = [];
+
+        session()->forget('loco_test_run_id');
     }
 
     public function switchLocale(string $locale): void
@@ -25,370 +117,568 @@ new class extends Component {
         session()->put('locale', $locale);
         app()->setLocale($locale);
     }
+
+    /**
+     * The landing page presents only normalized events as public cards.
+     * Eager-load data used by the card so no extra queries run per item.
+     */
+    private function refreshEventList(): void
+    {
+        $locale = app()->getLocale();
+
+        $this->events = Event::query()
+            ->with(['commune', 'categories', 'translations' => fn($query) => $query->where('locale', $locale)])
+            ->whereNotNull('normalized_json')
+            ->orderByDesc('id')
+            ->get();
+    }
+
+    /** Choose the translated event data for the active URL locale when present. */
+    public function localizedJson(Event $event): array
+    {
+        $sourceJson = $event->normalized_json ?? [];
+        $sourceLocale = $sourceJson['event']['language'] ?? null;
+        $locale = app()->getLocale();
+
+        if ($sourceLocale === $locale) {
+            return $sourceJson;
+        }
+
+        $translation = $event->translations->firstWhere('locale', $locale);
+
+        return $translation?->normalized_json ?? $sourceJson;
+    }
+
+    public function categoryName(Category $category): string
+    {
+        $column = 'name_' . app()->getLocale();
+
+        return $category->{$column} ?: $category->name_en;
+    }
+
+    /** Prefer the next occurrence, otherwise the latest past occurrence. */
+    public function displayOccurrence(array $occurrences): ?array
+    {
+        $occurrences = collect($occurrences)->filter(fn($occurrence) => is_array($occurrence) && !empty($occurrence['starts_at']))->sortBy('starts_at')->values();
+
+        if ($occurrences->isEmpty()) {
+            return null;
+        }
+
+        $upcoming = $occurrences->first(fn(array $occurrence) => CarbonImmutable::parse($occurrence['starts_at'])->gte(now()));
+
+        return $upcoming ?? $occurrences->last();
+    }
+
+    public function dateLabel(?string $date): ?string
+    {
+        if (!$date) {
+            return null;
+        }
+
+        return CarbonImmutable::parse($date)
+            ->locale(app()->getLocale())
+            ->translatedFormat('j M Y');
+    }
+
+    public function timeLabel(?string $date): ?string
+    {
+        return $date ? CarbonImmutable::parse($date)->format('H:i') : null;
+    }
+
+    private function hasActiveCrawl(int $communeId): bool
+    {
+        return CrawlRunSource::query()->whereHas('eventSource', fn($query) => $query->where('commune_id', $communeId))->whereHas('crawlRun', fn($query) => $query->whereIn('status', [CrawlRunStatus::Pending->value, CrawlRunStatus::Running->value]))->exists();
+    }
+
+    private function refreshCommuneOptions(): void
+    {
+        $registry = app(CrawlerAdapterRegistry::class);
+        $sources = EventSource::query()->with('commune')->where('is_active', true)->whereNotNull('commune_id')->whereNotNull('adapter')->orderBy('id')->get()->filter(fn(EventSource $source): bool => $source->commune !== null && is_string($source->adapter) && $registry->hasAdapter($source->adapter))->unique('commune_id');
+
+        $counts = Event::query()->selectRaw('commune_id, COUNT(*) AS total')->groupBy('commune_id')->pluck('total', 'commune_id');
+
+        $this->testCommunes = $sources
+            ->map(function (EventSource $source) use ($counts): array {
+                return [
+                    'slug' => $source->commune->slug,
+                    'name' => $source->commune->name,
+                    'count' => (int) ($counts[$source->commune_id] ?? 0),
+                    'busy' => $this->hasActiveCrawl((int) $source->commune_id),
+                ];
+            })
+            ->sortBy('name')
+            ->values()
+            ->all();
+    }
+
+    public function processTest(): void
+    {
+        $this->testMessage = '';
+        $this->testResult = [];
+
+        if ($this->testProcessing) {
+            return;
+        }
+
+        $slug = trim($this->selectedCommune);
+        if ($slug === '') {
+            $this->addError('selectedCommune', 'Veuillez sélectionner une commune.');
+            return;
+        }
+
+        $commune = Commune::query()->where('slug', $slug)->first();
+        if ($commune === null) {
+            $this->addError('selectedCommune', 'Commune inconnue.');
+            return;
+        }
+
+        // Public interface: cap how frequently one visitor and the whole site can start paid AI work.
+        $ipKey = 'loco-test:ip:' . hash('sha256', (string) request()->ip());
+        $globalKey = 'loco-test:global';
+        if (RateLimiter::tooManyAttempts($ipKey, 3) || RateLimiter::tooManyAttempts($globalKey, 20)) {
+            $this->testMessage = 'Limite temporaire atteinte. Réessayez plus tard.';
+            return;
+        }
+
+        try {
+            $result = Cache::lock('loco-test:commune:' . $commune->id, 15)->block(2, function () use ($commune, $slug, $ipKey, $globalKey): array {
+                // This is the authoritative server-side check, not the disabled button.
+                if (Event::query()->where('commune_id', $commune->id)->count() >= 2) {
+                    return ['error' => 'Cette commune possède déjà au moins 2 événements.'];
+                }
+
+                if ($this->hasActiveCrawl((int) $commune->id)) {
+                    return ['error' => 'Un traitement est déjà en cours pour cette commune.'];
+                }
+
+                $registry = app(CrawlerAdapterRegistry::class);
+                $source = EventSource::query()->with('commune')->where('commune_id', $commune->id)->where('is_active', true)->whereNotNull('adapter')->orderBy('id')->get()->first(fn(EventSource $candidate): bool => is_string($candidate->adapter) && $registry->hasAdapter($candidate->adapter));
+
+                if ($source === null) {
+                    return ['error' => 'Aucune source active prise en charge pour cette commune.'];
+                }
+
+                $options = CrawlOptions::fromConfig(communeSlugs: [$slug], eventLimit: 1, all: false, force: true, withoutEnrichment: false, scheduled: false);
+
+                $run = app(StartCrawl::class)->startForSource($options, $source);
+                $run->forceFill([
+                    'options' => array_merge($run->options ?? [], [
+                        'test_interface' => true,
+                    ]),
+                ])->save();
+                $runSource = $run->sources()->firstOrFail();
+
+                try {
+                    // Use an actual worker rather than performing OpenAI calls inside a web request.
+                    CrawlCommune::dispatch($runSource->id)->onConnection('database')->onQueue('default');
+                } catch (\Throwable $exception) {
+                    $runSource
+                        ->forceFill([
+                            'status' => CrawlRunStatus::Failed,
+                            'finished_at' => now(),
+                            'failure_reason' => 'Queue dispatch failed',
+                        ])
+                        ->save();
+                    $run->forceFill([
+                        'status' => CrawlRunStatus::Failed,
+                        'finished_at' => now(),
+                    ])->save();
+                    report($exception);
+                    return ['error' => 'Impossible de lancer la tâche de traitement.'];
+                }
+
+                RateLimiter::hit($ipKey, 3600);
+                RateLimiter::hit($globalKey, 86400);
+                return ['run_id' => $run->id];
+            });
+
+            if (isset($result['error'])) {
+                $this->testMessage = $result['error'];
+            } else {
+                $this->testRunId = (int) $result['run_id'];
+                session()->put('loco_test_run_id', $this->testRunId);
+                $this->testProcessing = true;
+                $this->testMessage = 'Traitement lancé. Recherche et normalisation en cours…';
+            }
+        } catch (\Illuminate\Contracts\Cache\LockTimeoutException $exception) {
+            $this->testMessage = 'Une autre demande est en cours. Réessayez dans un instant.';
+        } catch (\Throwable $exception) {
+            report($exception);
+            $this->testMessage = 'Une erreur est survenue lors du lancement.';
+        }
+
+        $this->refreshCommuneOptions();
+    }
+
+    public function refreshProcessingStatus(): void
+    {
+        if ($this->testRunId === null) {
+            return;
+        }
+
+        $run = CrawlRun::query()->with('sources.eventResults.event.translations')->find($this->testRunId);
+        if ($run === null) {
+            $this->testProcessing = false;
+            $this->testMessage = 'Le traitement est introuvable.';
+            return;
+        }
+
+        $source = $run->sources->first();
+        $record = $source?->eventResults->first();
+        $event = $record?->event;
+        $crawlFinished = $run->finished_at !== null;
+        $normalizationDone = $event !== null && is_array($event->normalized_json);
+        $primary = $event !== null && ($event->canonical_event_id === null || (int) \App\Models\CanonicalEvent::query()->whereKey($event->canonical_event_id)->value('primary_event_id') === (int) $event->id);
+
+        $sourceLocale = $normalizationDone ? $event->normalized_json['event']['language'] ?? 'fr' : null;
+        $targetLocales = array_values(array_diff(['fr', 'en', 'de', 'it', 'es', 'pt'], [$sourceLocale]));
+        $freshTranslations = $event?->translations->filter(fn($translation) => in_array($translation->locale, $targetLocales, true) && $translation->updated_at !== null && $translation->updated_at->gte($run->started_at))->pluck('locale')->unique()->values()->all() ?? [];
+
+        $this->testResult = [
+            'run_id' => $run->id,
+            'event_id' => $event?->id,
+            'title' => $normalizationDone ? $event->normalized_json['event']['identity']['title'] ?? 'Événement sans titre' : null,
+            'status' => $record?->status?->value ?? ($source?->status?->value ?? $run->status->value),
+            'normalized' => $normalizationDone,
+            'translations' => count($freshTranslations),
+            'translations_expected' => count($targetLocales),
+            'translation_applicable' => $event !== null && $normalizationDone && $primary,
+            'error' => $record?->error_message ?? $source?->failure_reason,
+        ];
+
+        if (!$crawlFinished) {
+            // Important: mount() must also enable polling after a full refresh.
+            $this->testProcessing = true;
+            $this->testMessage = 'Crawl et normalisation OpenAI en cours…';
+        } elseif ($event === null || !$normalizationDone || $run->status !== CrawlRunStatus::Completed) {
+            // Keep unsuccessful results visible so the tester can inspect them.
+            $this->testProcessing = false;
+            $this->testMessage = 'Traitement terminé avec une erreur ou aucun événement traité.';
+        } elseif (!$primary || count($freshTranslations) >= count($targetLocales)) {
+            // Successful completion, or an already-normalized secondary source
+            // which doesn't require translations: the event card is the result.
+            $this->clearCompletedTest();
+        } elseif ($run->started_at && $run->started_at->lt(now()->subMinutes(30))) {
+            $this->testProcessing = false;
+            $this->testMessage = 'Traductions incomplètes après 30 minutes. Vérifiez la queue et les tâches en échec.';
+        } else {
+            $this->testProcessing = true;
+            $this->testMessage = 'Crawl terminé. Traductions OpenAI en cours ou en attente…';
+        }
+
+        $this->refreshEventList();
+        $this->refreshCommuneOptions();
+    }
 };
 ?>
 
 <div class="min-h-screen font-['Archivo',system-ui,sans-serif] text-[15px] leading-[1.55] text-[#201e1d]">
-
-    <section class="min-w-screen min-h-screen space-y-4 overflow-y-auto bg-zinc-100 px-20 py-20">
-        @foreach ($events as $event)
-            <div class="bg-white p-6">
-                <p class="text-xl font-bold">{{ $event->commune?->name }}</p>
-                <div class="mt-4 bg-zinc-50 p-4">
-                    {!! $event->raw_html !!}
+    <section class="min-h-screen bg-zinc-100 px-4 py-8 sm:px-6 sm:py-12">
+        <div class="mx-auto max-w-[1180px] space-y-6">
+            <div class="border border-zinc-200 bg-white p-6">
+                <div class="mb-4">
+                    <h2 class="text-lg font-bold">Test de traitement des événements</h2>
+                    <p class="mt-1 text-sm text-zinc-600">Choisissez une commune pour traiter un événement avec OpenAI et ses traductions. Maximum : 2 événements par commune.</p>
                 </div>
-                <br>
-                <a class="text-sky-500 underline"
-                    href="{{ $event->event_url }}"
-                    target="_blank">{{ $event->event_url }}</a>
-            </div>
-        @endforeach
-    </section>
 
-    <!-- Navigation -->
-    {{-- <nav class="sticky top-0 z-20 flex flex-wrap items-center gap-4 border-b-2 border-[#201e1d]/40 px-4 py-3">
-        <span class="mr-auto text-lg font-extrabold">Loco-Locaux</span>
-        <a class="text-sm transition-colors hover:text-[#ec3013]"
-            href="#comment">{{ __('How it works') }}</a>
-
-        <div aria-label="Language"
-            class="inline-flex overflow-hidden border border-[#201e1d]/40"
-            role="group">
-            @foreach ($locales as $locale)
-                <button aria-pressed="{{ app()->getLocale() === $locale ? 'true' : 'false' }}"
-                    class="{{ app()->getLocale() === $locale ? 'bg-[#ec3013] text-[#f3f2f2] hover:bg-[#ec3013]' : '' }} border-l border-[#201e1d]/40 px-3 py-[7px] text-[13px] uppercase transition first:border-l-0 hover:bg-[#201e1d]/[0.07]"
-                    type="button"
-                    wire:click="switchLocale('{{ $locale }}')">
-                    {{ strtoupper($locale) }}
-                </button>
-            @endforeach
-        </div>
-
-        <button class="inline-flex items-center justify-center bg-[#ec3013] px-[14px] py-2 text-sm font-extrabold leading-[1.2] text-[#f3f2f2] transition hover:bg-[#dd2b0f] active:bg-[#ae1800]"
-            type="button">{{ __('Get the app') }}</button>
-    </nav> --}}
-    <!-- Hero -->
-    <section class="max-w-295 mx-auto flex h-screen flex-wrap items-center px-4 py-6 sm:px-6">
-        <div class="min-w-[280px] flex-[1_1_420px]">
-            <h1 class="mb-5 max-w-[16ch] text-[clamp(38px,5.4vw,64px)] font-extrabold leading-[1.06] tracking-[-0.02em]">{{ __('There is more happening around you than you think.') }}</h1>
-            <p class="mb-7 max-w-[46ch] text-lg leading-[1.6] opacity-85">{{ __('Every commune in Geneva runs its own agenda. We bring them together in one place, so your weekend doesn\'t depend on which website you remembered to check.') }}</p>
-            <div class="flex flex-wrap gap-3">
-                <button class="inline-flex items-center justify-center bg-[#ec3013] px-[14px] py-2 text-sm font-extrabold leading-[1.2] text-[#f3f2f2] transition hover:bg-[#dd2b0f] active:bg-[#ae1800]"
-                    type="button">{{ __('Get the app') }}</button>
-                <a class="inline-flex items-center justify-center border border-[#201e1d]/40 px-[14px] py-2 text-sm font-extrabold leading-[1.2] transition hover:bg-[#201e1d]/[0.07] active:bg-[#201e1d]/[0.14]"
-                    href="#discovery">{{ __('See what\'s on this weekend') }}</a>
-            </div>
-        </div>
-        <!-- App preview -->
-        <div class="w-full max-w-[320px] flex-[0_0_320px] border-2 border-[#201e1d]/40">
-            <div class="mx-auto my-2.5 h-1.5 w-[60px] bg-[#201e1d]/40"></div>
-            <div class="px-4 pb-5">
-                <p class="mb-3 text-[11px] uppercase tracking-[0.08em] opacity-55">Loco-Locaux</p>
-                <div class="mb-4 flex flex-wrap gap-1.5">
-                    <span class="inline-flex items-center bg-[#f8f4f4] px-2.5 py-[3px] text-[11px] tracking-[0.02em] text-[#444141]">{{ __('Tonight') }}</span>
-                    <span class="inline-flex items-center bg-[#f8f4f4] px-2.5 py-[3px] text-[11px] tracking-[0.02em] text-[#444141]">{{ __('This weekend') }}</span>
-                    <span class="inline-flex items-center bg-[#f8f4f4] px-2.5 py-[3px] text-[11px] tracking-[0.02em] text-[#444141]">{{ __('Near you') }}</span>
-                    <span class="inline-flex items-center bg-[#fff2ef] px-2.5 py-[3px] text-[11px] tracking-[0.02em] text-[#7c1405]">{{ __('Free') }}</span>
-                    <span class="inline-flex items-center bg-[#f8f4f4] px-2.5 py-[3px] text-[11px] tracking-[0.02em] text-[#444141]">{{ __('For families') }}</span>
-                    <span class="inline-flex items-center bg-[#f8f4f4] px-2.5 py-[3px] text-[11px] tracking-[0.02em] text-[#444141]">{{ __('Outdoors') }}</span>
-                </div>
-                <div class="mb-2.5 flex flex-col gap-2 bg-[#eae9e9] p-3 shadow-[0_1px_2px_rgba(45,43,43,0.14)]">
-                    <p class="text-[10px] uppercase tracking-[0.1em] text-[#ec3013]">Carouge</p>
-                    <h3 class="text-[17px] font-extrabold leading-[1.2]">{{ __('Carouge night market') }}</h3>
-                    <p class="text-[11px] text-[#201e1d]/50">
-                        <span>Sat 23 Aug</span>
-                        <span> · </span>
-                        <span>{{ __('Free') }}</span>
-                    </p>
-                </div>
-                <div class="flex flex-col gap-2 bg-[#eae9e9] p-3 shadow-[0_1px_2px_rgba(45,43,43,0.14)]">
-                    <p class="text-[10px] uppercase tracking-[0.1em] text-[#ec3013]">Parc des Bastions</p>
-                    <h3 class="text-[17px] font-extrabold leading-[1.2]">{{ __('Free concert, Parc des Bastions') }}</h3>
-                    <p class="text-[11px] text-[#201e1d]/50">
-                        <span>Fri 22 Aug, 20:00</span>
-                        <span> · </span>
-                        <span>{{ __('Free') }}</span>
-                    </p>
-                </div>
-            </div>
-        </div>
-    </section>
-
-    <hr class="mx-auto h-0.5 max-w-[1200px] border-0 bg-[#201e1d]/40" />
-    <!-- Problem recognition -->
-    <section class="mx-auto max-w-[1200px] px-[clamp(20px,5vw,72px)] py-[clamp(48px,6vw,72px)]">
-        <span class="mb-3.5 block text-[13px] uppercase tracking-[0.08em] text-[#ae1800]">{{ __('Today') }}</span>
-        <h2 class="mb-4 max-w-[20ch] text-[clamp(28px,3.6vw,42px)] font-extrabold leading-[1.1] tracking-[-0.015em]">{{ __('Finding one event shouldn\'t require five websites.') }}</h2>
-        <p class="mb-9 max-w-[56ch] text-base leading-[1.65] opacity-80">{{ __('Every commune keeps its own agenda: a website, a newsletter, a PDF, a social page. To know what\'s happening nearby, you\'d have to check them all, one at a time.') }}
-        </p>
-        <div class="flex flex-wrap gap-4">
-            <div class="min-w-[180px] flex-[1_1_180px] border border-[#201e1d]/40 bg-[#eae9e9] px-4 py-3.5">
-                <p class="mb-1.5 text-[10px] uppercase tracking-[0.1em] opacity-50">ville-meyrin.ch/agenda</p>
-                <p class="mb-2 text-base font-extrabold">Meyrin</p>
-                <p class="text-[11px] uppercase tracking-[0.08em] text-[#ae1800]">AGENDA</p>
-            </div>
-            <div class="min-w-[180px] flex-[1_1_180px] border border-[#201e1d]/40 bg-[#eae9e9] px-4 py-3.5">
-                <p class="mb-1.5 text-[10px] uppercase tracking-[0.1em] opacity-50">ville-vernier.ch/agenda</p>
-                <p class="mb-2 text-base font-extrabold">Vernier</p>
-                <p class="text-[11px] uppercase tracking-[0.08em] text-[#ae1800]">AGENDA</p>
-            </div>
-            <div class="min-w-[180px] flex-[1_1_180px] border border-[#201e1d]/40 bg-[#eae9e9] px-4 py-3.5">
-                <p class="mb-1.5 text-[10px] uppercase tracking-[0.1em] opacity-50">ville-carouge.ch/agenda</p>
-                <p class="mb-2 text-base font-extrabold">Carouge</p>
-                <p class="text-[11px] uppercase tracking-[0.08em] text-[#ae1800]">AGENDA</p>
-            </div>
-            <div class="min-w-[180px] flex-[1_1_180px] border border-[#201e1d]/40 bg-[#eae9e9] px-4 py-3.5">
-                <p class="mb-1.5 text-[10px] uppercase tracking-[0.1em] opacity-50">ville-onex.ch/agenda</p>
-                <p class="mb-2 text-base font-extrabold">Onex</p>
-                <p class="text-[11px] uppercase tracking-[0.08em] text-[#ae1800]">AGENDA</p>
-            </div>
-            <div class="min-w-[180px] flex-[1_1_180px] border border-[#201e1d]/40 bg-[#eae9e9] px-4 py-3.5">
-                <p class="mb-1.5 text-[10px] uppercase tracking-[0.1em] opacity-50">ville-genève.ch/agenda</p>
-                <p class="mb-2 text-base font-extrabold">Genève</p>
-                <p class="text-[11px] uppercase tracking-[0.08em] text-[#ae1800]">AGENDA</p>
-            </div>
-        </div>
-    </section>
-    <hr class="mx-auto h-0.5 max-w-[1200px] border-0 bg-[#201e1d]/40" />
-    <!-- Transformation -->
-    <section class="mx-auto max-w-[1200px] px-[clamp(20px,5vw,72px)] py-[clamp(48px,6vw,72px)]">
-        <span class="mb-3.5 block text-[13px] uppercase tracking-[0.08em] text-[#ae1800]">{{ __('The idea') }}</span>
-        <h2 class="mb-4 text-[clamp(28px,3.6vw,42px)] font-extrabold leading-[1.1] tracking-[-0.015em]">{{ __('45 communes. One experience.') }}</h2>
-        <p class="mb-9 max-w-[56ch] text-base leading-[1.65] opacity-80">{{ __('Not because the list is long — because you shouldn\'t have to think commune by commune. Interest first, commune second.') }}</p>
-        <div class="flex flex-wrap items-center gap-6">
-            <div class="min-w-[260px] flex-[1_1_320px] border border-[#201e1d]/40 p-5">
-                <p class="mb-3 text-[11px] uppercase tracking-[0.08em] opacity-55">{{ __('Search each commune site, one by one') }}</p>
-                <div class="flex flex-col gap-1.5 text-[13px] opacity-75">
-                    <span>Meyrin</span>
-                    <span>Vernier</span>
-                    <span>Carouge</span>
-                    <span>Onex</span>
-                    <span>Genève</span>
-                    <span>Lancy</span>
-                    <span>Satigny</span>
-                    <span>Grand-Saconnex</span>
-                    <span>Confignon</span>
-                    <span>Bernex</span>
-                </div>
-            </div>
-            <div class="flex-none text-[28px] font-extrabold text-[#ec3013]">→</div>
-            <div class="min-w-[260px] flex-[1_1_320px] border-2 border-[#ec3013] p-5">
-                <p class="mb-3 text-[11px] uppercase tracking-[0.08em] text-[#ae1800]">{{ __('Open one app, see what\'s around you') }}</p>
-                <p class="text-[22px] font-extrabold">Loco-Locaux</p>
-            </div>
-        </div>
-    </section>
-    <!-- Source file contains no actual image asset; this replaces its image-slot placeholder. -->
-    {{-- <div class="mx-auto max-w-[1200px] px-[clamp(20px,5vw,72px)] pb-[clamp(48px,6vw,72px)]">
-        <div class="flex aspect-[16/6] w-full items-center justify-center border border-[#201e1d]/40 bg-[#eae9e9] text-center text-sm text-[#201e1d]/45 contrast-[1.08] grayscale">
-            Drop a photo — a Geneva market, park or neighbourhood scene
-        </div>
-    </div> --}}
-    <hr class="mx-auto h-0.5 max-w-[1200px] border-0 bg-[#201e1d]/40" />
-    <!-- Discovery -->
-    <section class="mx-auto max-w-[1200px] scroll-mt-24 px-[clamp(20px,5vw,72px)] py-[clamp(48px,6vw,72px)]"
-        id="discovery">
-        <span class="mb-3.5 block text-[13px] uppercase tracking-[0.08em] text-[#ae1800]">{{ __('Search by what you feel like doing') }}</span>
-        <h2 class="mb-4 text-[clamp(28px,3.6vw,42px)] font-extrabold leading-[1.1] tracking-[-0.015em]">{{ __('Tonight. This weekend. Near you. Free.') }}</h2>
-        <p class="mb-7 max-w-[56ch] text-base leading-[1.65] opacity-80">{{ __('Filters built around real questions, not administrative categories.') }}</p>
-        <div class="mb-8 flex flex-wrap gap-2">
-            <span class="inline-flex items-center border border-[#ec3013] px-2.5 py-[3px] text-[11px] tracking-[0.02em] text-[#ec3013]">{{ __('Tonight') }}</span>
-            <span class="inline-flex items-center border border-[#ec3013] px-2.5 py-[3px] text-[11px] tracking-[0.02em] text-[#ec3013]">{{ __('This weekend') }}</span>
-            <span class="inline-flex items-center border border-[#ec3013] px-2.5 py-[3px] text-[11px] tracking-[0.02em] text-[#ec3013]">{{ __('Near you') }}</span>
-            <span class="inline-flex items-center border border-[#ec3013] px-2.5 py-[3px] text-[11px] tracking-[0.02em] text-[#ec3013]">{{ __('Free') }}</span>
-            <span class="inline-flex items-center border border-[#ec3013] px-2.5 py-[3px] text-[11px] tracking-[0.02em] text-[#ec3013]">{{ __('For families') }}</span>
-            <span class="inline-flex items-center border border-[#ec3013] px-2.5 py-[3px] text-[11px] tracking-[0.02em] text-[#ec3013]">{{ __('Outdoors') }}</span>
-            <span class="inline-flex items-center border border-[#ec3013] px-2.5 py-[3px] text-[11px] tracking-[0.02em] text-[#ec3013]">{{ __('Culture') }}</span>
-            <span class="inline-flex items-center border border-[#ec3013] px-2.5 py-[3px] text-[11px] tracking-[0.02em] text-[#ec3013]">{{ __('Food &amp; markets') }}</span>
-            <span class="inline-flex items-center border border-[#ec3013] px-2.5 py-[3px] text-[11px] tracking-[0.02em] text-[#ec3013]">{{ __('Sports') }}</span>
-            <span class="inline-flex items-center border border-[#ec3013] px-2.5 py-[3px] text-[11px] tracking-[0.02em] text-[#ec3013]">{{ __('For seniors') }}</span>
-        </div>
-        <div class="grid grid-cols-[repeat(auto-fit,minmax(240px,1fr))] gap-4">
-            <article class="flex flex-col gap-2 bg-[#eae9e9] p-3 shadow-[0_1px_2px_rgba(45,43,43,0.14)]">
-                <p class="text-[10px] uppercase tracking-[0.1em] text-[#ec3013]">Carouge</p>
-                <h3 class="text-[17px] font-extrabold leading-[1.2]">{{ __('Carouge night market') }}</h3>
-                <p class="flex-1 text-[13px] opacity-80">Sat 23 Aug</p>
-                <p class="text-[11px] text-[#201e1d]/50">{{ __('Free') }}</p>
-            </article>
-            <article class="flex flex-col gap-2 bg-[#eae9e9] p-3 shadow-[0_1px_2px_rgba(45,43,43,0.14)]">
-                <p class="text-[10px] uppercase tracking-[0.1em] text-[#ec3013]">Onex</p>
-                <h3 class="text-[17px] font-extrabold leading-[1.2]">{{ __('Children\'s workshop, Onex') }}</h3>
-                <p class="flex-1 text-[13px] opacity-80">Sun 24 Aug, 10:00</p>
-                <p class="text-[11px] text-[#201e1d]/50">{{ __('Free') }}</p>
-            </article>
-            <article class="flex flex-col gap-2 bg-[#eae9e9] p-3 shadow-[0_1px_2px_rgba(45,43,43,0.14)]">
-                <p class="text-[10px] uppercase tracking-[0.1em] text-[#ec3013]">Vernier</p>
-                <h3 class="text-[17px] font-extrabold leading-[1.2]">{{ __('Open-air cinema, Vernier') }}</h3>
-                <p class="flex-1 text-[13px] opacity-80">Sat 23 Aug, 21:30</p>
-                <p class="text-[11px] text-[#201e1d]/50">{{ __('Free') }}</p>
-            </article>
-        </div>
-    </section>
-    <hr class="mx-auto h-0.5 max-w-[1200px] border-0 bg-[#201e1d]/40" />
-    <!-- Serendipity -->
-    <section class="mx-auto max-w-[1200px] px-[clamp(20px,5vw,72px)] py-[clamp(48px,6vw,72px)]">
-        <span class="mb-3.5 block text-[13px] uppercase tracking-[0.08em] text-[#ae1800]">{{ __('Around the corner') }}</span>
-        <h2 class="mb-4 max-w-[24ch] text-[clamp(28px,3.6vw,42px)] font-extrabold leading-[1.1] tracking-[-0.015em]">{{ __('The best event might be the one you weren\'t looking for.') }}</h2>
-        <p class="mb-8 max-w-[56ch] text-base leading-[1.65] opacity-80">{{ __('A pop-up market in Carouge. A free concert at the Parc des Bastions. A workshop in Onex you\'d never have found on your own.') }}</p>
-        <div class="grid grid-cols-[repeat(auto-fit,minmax(200px,1fr))] gap-3.5">
-            <article class="flex flex-col gap-2 bg-[#eae9e9] p-3">
-                <p class="text-[10px] uppercase tracking-[0.1em] text-[#ec3013]">Carouge</p>
-                <h3 class="text-[15px] font-extrabold leading-[1.2]">{{ __('Carouge night market') }}</h3>
-            </article>
-            <article class="flex flex-col gap-2 bg-[#eae9e9] p-3">
-                <p class="text-[10px] uppercase tracking-[0.1em] text-[#ec3013]">Onex</p>
-                <h3 class="text-[15px] font-extrabold leading-[1.2]">{{ __('Children\'s workshop, Onex') }}</h3>
-            </article>
-            <article class="flex flex-col gap-2 bg-[#eae9e9] p-3">
-                <p class="text-[10px] uppercase tracking-[0.1em] text-[#ec3013]">Meyrin</p>
-                <h3 class="text-[15px] font-extrabold leading-[1.2]">{{ __('Tea dance for seniors, Meyrin') }}</h3>
-            </article>
-            <article class="flex flex-col gap-2 bg-[#eae9e9] p-3">
-                <p class="text-[10px] uppercase tracking-[0.1em] text-[#ec3013]">Vernier</p>
-                <h3 class="text-[15px] font-extrabold leading-[1.2]">{{ __('Open-air cinema, Vernier') }}</h3>
-            </article>
-        </div>
-    </section>
-    <hr class="mx-auto h-0.5 max-w-[1200px] border-0 bg-[#201e1d]/40" />
-    <!-- No borders -->
-    <section class="mx-auto max-w-[1200px] px-[clamp(20px,5vw,72px)] py-[clamp(48px,6vw,72px)]">
-        <span class="mb-3.5 block text-[13px] uppercase tracking-[0.08em] text-[#ae1800]">{{ __('No borders') }}</span>
-        <h2 class="mb-4 max-w-[22ch] text-[clamp(28px,3.6vw,42px)] font-extrabold leading-[1.1] tracking-[-0.015em]">{{ __('Geneva doesn\'t stop at your commune. Neither should your plans.') }}</h2>
-        <p class="mb-10 max-w-[56ch] text-base leading-[1.65] opacity-80">{{ __('Live in Meyrin? Something in Vernier, Grand-Saconnex or Satigny might be ten minutes away, and worth the trip.') }}</p>
-        <div class="relative flex flex-wrap items-center justify-center gap-5">
-            <div class="border-2 border-[#ec3013] px-[22px] py-4 text-sm font-extrabold text-[#ae1800]">{{ __('You') }}</div>
-            <div class="border border-[#201e1d]/40 px-[18px] py-3.5 text-center">
-                <p class="mb-1 text-sm font-extrabold">Vernier</p>
-                <p class="text-xs opacity-55">10 min</p>
-            </div>
-            <div class="border border-[#201e1d]/40 px-[18px] py-3.5 text-center">
-                <p class="mb-1 text-sm font-extrabold">Grand-Saconnex</p>
-                <p class="text-xs opacity-55">12 min</p>
-            </div>
-            <div class="border border-[#201e1d]/40 px-[18px] py-3.5 text-center">
-                <p class="mb-1 text-sm font-extrabold">Satigny</p>
-                <p class="text-xs opacity-55">15 min</p>
-            </div>
-            <div class="border border-[#201e1d]/40 px-[18px] py-3.5 text-center">
-                <p class="mb-1 text-sm font-extrabold">Carouge</p>
-                <p class="text-xs opacity-55">18 min</p>
-            </div>
-        </div>
-    </section>
-    <hr class="mx-auto h-0.5 max-w-[1200px] border-0 bg-[#201e1d]/40" />
-    <!-- Save / reminder flow -->
-    <section class="mx-auto max-w-[1200px] px-[clamp(20px,5vw,72px)] py-[clamp(48px,6vw,72px)]">
-        <span class="mb-3.5 block text-[13px] uppercase tracking-[0.08em] text-[#ae1800]">{{ __('After you find it') }}</span>
-        <h2 class="mb-4 max-w-[24ch] text-[clamp(28px,3.6vw,42px)] font-extrabold leading-[1.1] tracking-[-0.015em]">{{ __('Found something for Saturday? We\'ll help you remember it.') }}</h2>
-        <p class="mb-10 max-w-[56ch] text-base leading-[1.65] opacity-80">{{ __('Discovering an event is only the beginning.') }}</p>
-        <div class="grid grid-cols-[repeat(auto-fit,minmax(180px,1fr))]">
-            <div class="border-b border-[#201e1d]/40 py-5 sm:border-b-0 sm:border-r sm:pr-5 sm:pt-0">
-                <p class="mb-2 text-[13px] font-extrabold text-[#ae1800]">01</p>
-                <p class="mb-2 text-[19px] font-extrabold">{{ __('Discover') }}</p>
-                <p class="text-sm leading-[1.5] opacity-75">{{ __('Come across something worth doing') }}</p>
-            </div>
-            <div class="border-b border-[#201e1d]/40 py-5 sm:border-b-0 sm:border-r sm:px-5 sm:pt-0">
-                <p class="mb-2 text-[13px] font-extrabold text-[#ae1800]">02</p>
-                <p class="mb-2 text-[19px] font-extrabold">{{ __('Save') }}</p>
-                <p class="text-sm leading-[1.5] opacity-75">{{ __('Keep it, so you don\'t lose it in a busy week') }}</p>
-            </div>
-            <div class="border-b border-[#201e1d]/40 py-5 sm:border-b-0 sm:border-r sm:px-5 sm:pt-0">
-                <p class="mb-2 text-[13px] font-extrabold text-[#ae1800]">03</p>
-                <p class="mb-2 text-[19px] font-extrabold">{{ __('Reminder') }}</p>
-                <p class="text-sm leading-[1.5] opacity-75">{{ __('We nudge you before it starts') }}</p>
-            </div>
-            <div class="py-5 sm:pl-5 sm:pt-0">
-                <p class="mb-2 text-[13px] font-extrabold text-[#ae1800]">04</p>
-                <p class="mb-2 text-[19px] font-extrabold">{{ __('Go') }}</p>
-                <p class="text-sm leading-[1.5] opacity-75">{{ __('Show up, plan made') }}</p>
-            </div>
-        </div>
-    </section>
-    <hr class="mx-auto h-0.5 max-w-[1200px] border-0 bg-[#201e1d]/40" />
-    <!-- Language experience -->
-    <section class="mx-auto flex max-w-[1200px] flex-wrap items-center gap-[clamp(24px,5vw,56px)] px-[clamp(20px,5vw,72px)] py-[clamp(48px,6vw,72px)]">
-        <div class="min-w-[280px] flex-[1_1_380px]">
-            <span class="mb-3.5 block text-[13px] uppercase tracking-[0.08em] text-[#ae1800]">{{ __('In your language') }}</span>
-            <h2 class="mb-4 max-w-[22ch] text-[clamp(28px,3.6vw,40px)] font-extrabold leading-[1.1] tracking-[-0.015em]">{{ __('Local life shouldn\'t depend on the language you speak.') }}</h2>
-            <p class="mb-6 max-w-[48ch] text-base leading-[1.65] opacity-80">{{ __('The same event, presented naturally in the language you\'re comfortable with — try the toggle.') }}</p>
-            <div aria-label="Preview language"
-                class="inline-flex overflow-hidden border border-[#201e1d]/40"
-                role="group">
-                @foreach ($locales as $locale)
-                    <button class="{{ app()->getLocale() === $locale ? 'bg-[#ec3013] text-[#f3f2f2] hover:bg-[#ec3013]' : '' }} border-l border-[#201e1d]/40 px-3 py-[7px] text-[13px] uppercase transition first:border-l-0 hover:bg-[#201e1d]/[0.07]"
-                        type="button"
-                        wire:click="switchLocale('{{ $locale }}')">
-                        {{ strtoupper($locale) }}
+                <form class="flex flex-col gap-3 sm:flex-row sm:items-end"
+                    wire:submit="processTest">
+                    <div class="flex-1">
+                        <label class="mb-1 block text-sm font-semibold"
+                            for="test-commune">Commune</label>
+                        <select @disabled($testProcessing)
+                            class="w-full border border-zinc-300 bg-white px-3 py-2 text-sm focus:border-[#ec3013] focus:outline-none"
+                            id="test-commune"
+                            wire:model.live="selectedCommune">
+                            <option value="">Sélectionner une commune</option>
+                            @foreach ($testCommunes as $commune)
+                                <option @disabled($commune['count'] >= 2 || $commune['busy'])
+                                    value="{{ $commune['slug'] }}">
+                                    {{ $commune['name'] }} ({{ $commune['count'] }}/2){{ $commune['busy'] ? ' — en cours' : '' }}
+                                </option>
+                            @endforeach
+                        </select>
+                        @error('selectedCommune')
+                            <p class="mt-1 text-xs text-red-600">{{ $message }}</p>
+                        @enderror
+                    </div>
+                    @php
+                        $selectedOption = collect($testCommunes)->firstWhere('slug', $selectedCommune);
+                        $testDisabled = $testProcessing || !$selectedOption || $selectedOption['count'] >= 2 || $selectedOption['busy'];
+                    @endphp
+                    <button @disabled($testDisabled)
+                        class="inline-flex min-h-10 items-center justify-center gap-2 bg-[#201e1d] px-6 py-2 text-sm font-semibold text-white hover:bg-[#ec3013] disabled:cursor-not-allowed disabled:bg-zinc-300 disabled:text-zinc-600"
+                        type="submit"
+                        wire:loading.attr="disabled"
+                        wire:target="processTest">
+                        <svg class="size-4 animate-spin"
+                            fill="none"
+                            viewBox="0 0 24 24"
+                            wire:loading
+                            wire:target="processTest">
+                            <circle class="opacity-30"
+                                cx="12"
+                                cy="12"
+                                r="9"
+                                stroke-width="3"
+                                stroke="currentColor" />
+                            <path d="M21 12a9 9 0 0 0-9-9"
+                                stroke-linecap="round"
+                                stroke-width="3"
+                                stroke="currentColor" />
+                        </svg>
+                        <span wire:loading.remove
+                            wire:target="processTest">Importer un événement</span>
+                        <span wire:loading
+                            wire:target="processTest">Lancement…</span>
                     </button>
-                @endforeach
+                </form>
+
+                @if ($testMessage !== '')
+                    <div class="mt-4 border-l-2 border-[#ec3013] bg-zinc-50 px-4 py-3 text-sm"
+                        role="status">
+                        <div class="flex items-center gap-2">
+                            @if ($testProcessing)
+                                <svg class="size-4 animate-spin"
+                                    fill="none"
+                                    viewBox="0 0 24 24">
+                                    <circle class="opacity-30"
+                                        cx="12"
+                                        cy="12"
+                                        r="9"
+                                        stroke-width="3"
+                                        stroke="currentColor" />
+                                    <path d="M21 12a9 9 0 0 0-9-9"
+                                        stroke-linecap="round"
+                                        stroke-width="3"
+                                        stroke="currentColor" />
+                                </svg>
+                            @endif
+                            <span>{{ $testMessage }}</span>
+                        </div>
+                        @if ($testProcessing)
+                            <div wire:poll.3s="refreshProcessingStatus"></div>
+                        @endif
+                        @if ($testResult !== [])
+                            <div class="mt-3 space-y-1 text-xs text-zinc-600">
+                                <p>Run #{{ $testResult['run_id'] }} · {{ $testResult['status'] }}</p>
+                                @if ($testResult['title'])
+                                    <p class="font-semibold text-zinc-900">{{ $testResult['title'] }}</p>
+                                @endif
+                                <p>Normalisation : {{ $testResult['normalized'] ? 'OK' : 'En attente / échec' }}</p>
+                                <p>Traductions :
+                                    {{ $testResult['translation_applicable'] ? $testResult['translations'] . '/' . $testResult['translations_expected'] : ($testResult['normalized'] ? 'Non applicable (source secondaire)' : 'En attente') }}</p>
+                                @if ($testResult['error'])
+                                    <p class="text-red-700">{{ $testResult['error'] }}</p>
+                                @endif
+                                @if ($testResult['event_id'])
+                                    <a class="font-semibold text-sky-600 underline"
+                                        href="{{ route('events.show', ['locale' => request()->route('locale') ?? 'fr', 'event' => $testResult['event_id']]) }}">Voir l’événement</a>
+                                @endif
+                            </div>
+                        @endif
+                    </div>
+                @endif
             </div>
+
+            {{-- Public event cards — same visual design and navigation as events.blade.php. --}}
+            @if ($events->isNotEmpty())
+                <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                    @foreach ($events as $event)
+                        @php
+                            $json = $this->localizedJson($event);
+                            $eventData = $json['event'] ?? [];
+                            $identity = $eventData['identity'] ?? [];
+                            $hero = $eventData['media']['hero'] ?? null;
+                            $location = $eventData['location'] ?? [];
+                            $pricing = $eventData['pricing'] ?? [];
+                            $occurrence = $this->displayOccurrence($json['occurrences'] ?? []);
+                            $isFree = ($pricing['is_free'] ?? false) === true;
+                            $hasPrice = !empty($pricing['summary']);
+                            $primaryCategory = $event->categories->first(fn($category) => (bool) $category->pivot->is_primary);
+                            $primaryCategoryName = $primaryCategory ? $this->categoryName($primaryCategory) : null;
+                        @endphp
+
+                        <article class="group relative flex min-w-0 flex-col overflow-hidden rounded-md bg-white shadow"
+                            wire:key="event-{{ $event->id }}">
+
+                            <a class="flex h-full flex-col"
+                                href="{{ route('events.show', [
+                                    'locale' => app()->getLocale(),
+                                    'event' => $event,
+                                ]) }}"
+                                wire:navigate>
+
+                                {{-- Image --}}
+                                <div class="aspect-16/10 relative overflow-hidden bg-[#e9e8e8]">
+
+                                    @if (!empty($hero['url']))
+                                        <img alt="{{ $hero['alt'] ?? ($identity['title'] ?? '') }}"
+                                            class="h-full w-full object-cover grayscale-[15%] transition duration-300 group-hover:scale-[1.02] group-hover:grayscale-0"
+                                            loading="lazy"
+                                            src="{{ $hero['url'] }}">
+                                    @else
+                                        <div class="flex h-full items-center justify-center">
+
+                                            <svg class="size-9 text-[#201e1d]/25"
+                                                fill="none"
+                                                stroke="currentColor"
+                                                viewBox="0 0 24 24">
+                                                <path
+                                                    d="m2.25 15.75 5.159-5.159a2.25 2.25 0 0 1 3.182 0l5.159 5.159m-1.5-1.5 1.409-1.409a2.25 2.25 0 0 1 3.182 0l2.909 2.909M6.75 6.75h.008v.008H6.75V6.75Zm-2.25 13.5h15a2.25 2.25 0 0 0 2.25-2.25V6A2.25 2.25 0 0 0 19.5 3.75h-15A2.25 2.25 0 0 0 2.25 6v12a2.25 2.25 0 0 0 2.25 2.25Z"
+                                                    stroke-linecap="round"
+                                                    stroke-linejoin="round"
+                                                    stroke-width="1.4" />
+                                            </svg>
+
+                                        </div>
+                                    @endif
+
+                                    {{-- Commune + Category --}}
+                                    <div class="absolute bottom-0 left-0 flex">
+
+                                        @if ($event->commune)
+                                            <span class="inline-flex bg-[#f3f2f2] px-3 py-2 text-[10px] font-bold uppercase tracking-[0.12em] text-[#201e1d]">
+                                                {{ $event->commune->name }}
+                                            </span>
+                                        @endif
+
+                                        @if ($primaryCategoryName)
+                                            <span class="inline-flex bg-[#201e1d] px-3 py-2 text-[10px] font-bold uppercase tracking-[0.12em] text-white">
+                                                {{ $primaryCategoryName }}
+                                            </span>
+                                        @endif
+
+                                    </div>
+
+                                    {{-- Free --}}
+                                    @if ($isFree)
+                                        <span class="absolute right-0 top-0 bg-[#ec3013] px-3 py-2 text-[10px] font-black uppercase tracking-[0.12em] text-white">
+                                            {{ __('Free') }}
+                                        </span>
+                                    @endif
+
+                                </div>
+
+                                {{-- Card body --}}
+                                <div class="flex flex-1 flex-col p-5 sm:p-6">
+
+                                    {{-- Date --}}
+                                    @if ($occurrence)
+                                        <div class="mb-4 flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.1em] text-[#201e1d]/55">
+
+                                            <svg class="size-3.5 shrink-0 text-[#ec3013]"
+                                                fill="none"
+                                                stroke="currentColor"
+                                                viewBox="0 0 24 24">
+                                                <path d="M6.75 3v2.25M17.25 3v2.25M3.75 9.75h16.5"
+                                                    stroke-linecap="round"
+                                                    stroke-linejoin="round"
+                                                    stroke-width="1.8" />
+
+                                                <path d="M5.25 5.25h13.5a1.5 1.5 0 0 1 1.5 1.5v12a1.5 1.5 0 0 1-1.5 1.5H5.25a1.5 1.5 0 0 1-1.5-1.5v-12a1.5 1.5 0 0 1 1.5-1.5Z"
+                                                    stroke-linecap="round"
+                                                    stroke-linejoin="round"
+                                                    stroke-width="1.8" />
+                                            </svg>
+
+                                            <span>
+                                                {{ $this->dateLabel($occurrence['starts_at'] ?? null) }}
+
+                                                @if (!empty($occurrence['starts_at']))
+                                                    · {{ $this->timeLabel($occurrence['starts_at']) }}
+                                                @endif
+                                            </span>
+
+                                        </div>
+                                    @endif
+
+                                    {{-- Title --}}
+                                    <h3 class="text-xl font-black leading-[1.1] tracking-[-0.025em] transition-colors group-hover:text-[#ec3013] sm:text-[1.4rem]">
+                                        {{ $identity['title'] ?? __('Event') }}
+                                    </h3>
+
+                                    {{-- Summary --}}
+                                    @if (!empty($eventData['summary']))
+                                        <p class="mt-3 line-clamp-3 text-[13px] leading-5 text-[#201e1d]/65">
+                                            {{ $eventData['summary'] }}
+                                        </p>
+                                    @endif
+
+                                    <div class="flex-1"></div>
+
+                                    {{-- Location --}}
+                                    @if (!empty($location['name']) || !empty($location['address']))
+                                        <div class="mt-6 flex items-start gap-2 border-t border-[#201e1d]/25 pt-3 text-xs text-[#201e1d]/65">
+
+                                            <svg class="mt-0.5 size-3.5 shrink-0"
+                                                fill="none"
+                                                stroke="currentColor"
+                                                viewBox="0 0 24 24">
+                                                <path d="M12 21s6-5.686 6-12A6 6 0 1 0 6 9c0 6.314 6 12 6 12Z"
+                                                    stroke-linecap="round"
+                                                    stroke-linejoin="round"
+                                                    stroke-width="1.7" />
+
+                                                <circle cx="12"
+                                                    cy="9"
+                                                    r="2"
+                                                    stroke-width="1.7" />
+                                            </svg>
+
+                                            <span class="line-clamp-1 font-medium">
+                                                {{ $location['name'] ?: $location['address'] }}
+                                            </span>
+
+                                        </div>
+                                    @endif
+
+                                    {{-- Footer --}}
+                                    <div class="mt-3 flex min-h-10 items-end justify-between gap-5">
+
+                                        <div class="text-xs font-bold">
+
+                                            @if ($isFree)
+                                                <span class="text-[#ec3013]">
+                                                    {{ __('Free') }}
+                                                </span>
+                                            @elseif ($hasPrice)
+                                                <span>
+                                                    {{ $pricing['summary'] }}
+                                                </span>
+                                            @endif
+
+                                        </div>
+
+                                        <span class="inline-flex shrink-0 items-center gap-2 border-b border-[#201e1d] pb-0.5 text-xs font-bold transition-all group-hover:border-[#ec3013] group-hover:text-[#ec3013]">
+
+                                            {{ __('View event') }}
+
+                                            <svg class="size-3.5 transition-transform group-hover:translate-x-0.5"
+                                                fill="none"
+                                                stroke="currentColor"
+                                                viewBox="0 0 24 24">
+                                                <path d="m9 5 7 7-7 7"
+                                                    stroke-linecap="round"
+                                                    stroke-linejoin="round"
+                                                    stroke-width="2" />
+                                            </svg>
+
+                                        </span>
+
+                                    </div>
+
+                                </div>
+
+                            </a>
+
+                        </article>
+                    @endforeach
+                </div>
+            @endif
         </div>
-        <article class="w-full max-w-[320px] flex-[0_0_320px] border border-[#201e1d]/40 bg-[#eae9e9] p-[18px]">
-            <p class="mb-2 text-[10px] uppercase tracking-[0.1em] text-[#ec3013]">Parc des Bastions</p>
-            <h3 class="mb-2 text-[19px] font-extrabold">{{ __('Free concert, Parc des Bastions') }}</h3>
-            <p class="text-sm leading-[1.55] opacity-80">{{ __('An open-air evening of music by the lake, open to everyone, no ticket required.') }}</p>
-        </article>
     </section>
-    <hr class="mx-auto h-0.5 max-w-[1200px] border-0 bg-[#201e1d]/40" />
-    <!-- Standard event layout -->
-    <section class="mx-auto flex max-w-[1200px] flex-wrap-reverse items-center gap-[clamp(24px,5vw,64px)] px-[clamp(20px,5vw,72px)] py-[clamp(48px,6vw,72px)]">
-        <article class="w-full max-w-[320px] flex-[0_0_320px] border-2 border-[#201e1d]/40 p-[18px]">
-            <p class="mb-2.5 text-[11px] uppercase tracking-[0.08em] text-[#ae1800]">Parc des Bastions</p>
-            <h3 class="mb-3.5 text-[21px] font-extrabold">{{ __('Free concert, Parc des Bastions') }}</h3>
-            <div class="flex flex-col gap-2 border-t border-[#201e1d]/40 pt-3 text-[13px]">
-                <div class="flex justify-between gap-4">
-                    <span class="opacity-55">{{ __('Date') }}</span>
-                    <span class="text-right font-semibold">Fri 22 Aug</span>
-                </div>
-                <div class="flex justify-between gap-4">
-                    <span class="opacity-55">{{ __('Time') }}</span>
-                    <span class="text-right font-semibold">20:00</span>
-                </div>
-                <div class="flex justify-between gap-4">
-                    <span class="opacity-55">{{ __('Location') }}</span>
-                    <span class="text-right font-semibold">Parc des Bastions</span>
-                </div>
-                <div class="flex justify-between gap-4">
-                    <span class="opacity-55">{{ __('Commune') }}</span>
-                    <span class="text-right font-semibold">Parc des Bastions</span>
-                </div>
-                <div class="flex justify-between gap-4">
-                    <span class="opacity-55">{{ __('Price') }}</span>
-                    <span class="text-right font-semibold">{{ __('Free') }}</span>
-                </div>
-                <div class="flex justify-between gap-4">
-                    <span class="opacity-55">{{ __('Audience') }}</span>
-                    <span class="text-right font-semibold">{{ __('All ages') }}</span>
-                </div>
-            </div>
-            <div class="mt-4 flex gap-2">
-                <button class="flex-1 bg-[#ec3013] px-[14px] py-2 text-sm font-extrabold text-[#f3f2f2] transition hover:bg-[#dd2b0f] active:bg-[#ae1800]"
-                    type="button">{{ __('Save') }}</button>
-                <button class="flex-1 border border-[#201e1d]/40 px-[14px] py-2 text-sm font-extrabold transition hover:bg-[#201e1d]/[0.07] active:bg-[#201e1d]/[0.14]"
-                    type="button">{{ __('Remind me') }}</button>
-            </div>
-        </article>
-        <div class="min-w-[280px] flex-[1_1_380px]">
-            <span class="mb-3.5 block text-[13px] uppercase tracking-[0.08em] text-[#ae1800]">{{ __('Every event, laid out the same way') }}</span>
-            <h2 class="mb-4 max-w-[20ch] text-[clamp(28px,3.6vw,40px)] font-extrabold leading-[1.1] tracking-[-0.015em]">{{ __('One layout. Every time.') }}</h2>
-            <p class="max-w-[48ch] text-base leading-[1.65] opacity-80">{{ __('Title, date, time, location, price, audience, organiser — always in the same place, however the source presented it.') }}</p>
-        </div>
-    </section>
-    <!-- Closing CTA -->
-    <section class="scroll-mt-20 bg-[#ec3013] py-[clamp(56px,8vw,96px)] text-[#f3f2f2]"
-        id="comment">
-        <div class="mx-auto max-w-[1200px] px-[clamp(20px,5vw,72px)]">
-            <h2 class="mb-4 max-w-[20ch] text-[clamp(30px,4.4vw,52px)] font-extrabold leading-[1.1] tracking-[-0.015em]">{{ __('Your next plan might already be happening nearby.') }}</h2>
-            <p class="mb-7 max-w-[44ch] text-[17px] leading-[1.6] opacity-90">{{ __('Discover events across Geneva, in one place.') }}</p>
-            <div class="flex flex-wrap items-center gap-3">
-                <button class="border-[1.5px] border-[#f3f2f2] px-[14px] py-2 text-sm font-extrabold text-[#f3f2f2] transition hover:bg-white/10 active:bg-white/20"
-                    type="button">{{ __('Get the app') }}</button>
-                <div class="flex flex-wrap gap-2.5">
-                    <span class="border-[1.5px] border-[#f3f2f2] px-4 py-[9px] text-[13px] font-semibold">App Store</span>
-                    <span class="border-[1.5px] border-[#f3f2f2] px-4 py-[9px] text-[13px] font-semibold">▶ Google Play</span>
-                </div>
-            </div>
-        </div>
-    </section>
+
     <footer class="mx-auto max-w-[1200px] px-[clamp(20px,5vw,72px)] py-6 text-[13px] opacity-55">{{ __('Loco-Locaux brings together event listings published by Geneva\'s communes.') }}</footer>
 </div>
